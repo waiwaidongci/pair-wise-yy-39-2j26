@@ -1,1 +1,88 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大坝巡检、缺陷与应急管理</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>大坝巡检、缺陷与应急管理</h1><p>安排巡检，记录渗流、位移、裂缝等缺陷并跟踪修复、复检和应急预案</p><p>异常值比控制阈值越高，缺陷优先级越高；应急处置缺陷必须完成复检并记录证据后才能关闭。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>大坝巡检、缺陷与应急管理</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;max-width:1000px;margin:1.5rem auto;padding:0 1rem;color:#17212b}
+h1{font-size:1.4rem}
+button{padding:.45rem .9rem;margin:.2rem .2rem .2rem 0;border:1px solid #2f6fb0;background:#f4f8fc;border-radius:4px;cursor:pointer}
+button.active{background:#2f6fb0;color:#fff}
+table{border-collapse:collapse;width:100%;margin-top:.8rem;font-size:.9rem}
+th,td{border:1px solid #d8e0e8;padding:.4rem .55rem;text-align:left;vertical-align:top}
+th{background:#f0f4f8}
+.tag{display:inline-block;padding:.05rem .45rem;border-radius:10px;font-size:.78rem;color:#fff}
+.tag-breach{background:#c0392b}.tag-review{background:#d68910}.tag-ok{background:#7f8c8d}
+.tag-open{background:#c0392b}.tag-accepted{background:#1e8449}
+.muted{color:#66788a;font-size:.85rem}
+</style>
+</head>
+<body>
+<h1>大坝巡检、缺陷与应急管理</h1>
+<p class="muted">汛期值班：一批可登记多个坝段读数；渗流/位移/裂缝超控制值自动进入优先队列并生成带责任人和到场时限的处置任务；
+重复外部编号按最早报告时间合并，矛盾读数进入待复核；复检记录缺失不能关闭。</p>
+<div>
+  <strong>批次：</strong>
+  <button onclick="loadBatches('')" id="bq-">全部</button>
+  <button onclick="loadBatches('priority')" id="bq-priority">优先队列</button>
+  <button onclick="loadBatches('review')" id="bq-review">待复核</button>
+  <span class="muted">｜</span>
+  <button onclick="loadTasks()">刷新处置任务</button>
+</div>
+<div id="batches"></div>
+<div id="tasks"></div>
+<script>
+const METRICS={seepage:'渗流',displacement:'位移',crack:'裂缝'};
+const HDR={'X-Actor':'duty','X-Role':'viewer'};
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function fmt(iso){return iso?iso.replace('T',' ').replace('+00:00','Z'):'';}
+async function loadBatches(queue){
+  for (const q of ['','priority','review']){
+    document.getElementById('bq-'+q).classList.toggle('active',q===queue);
+  }
+  const r=await fetch('/api/batches'+(queue?'?queue='+queue:''),{headers:HDR});
+  const data=await r.json();
+  const batches=data.batches||[];
+  document.getElementById('batches').innerHTML=batches.map(b=>`
+    <table>
+      <thead><tr><th>批次 #${b.id} ${esc(b.batch_ref||'')}
+        <span class="muted">巡检人 ${esc(b.inspector)} · ${fmt(b.created_at)}</span>
+        ${b.breach_count?'<span class="tag tag-breach">超控制值 '+b.breach_count+'</span>':''}
+        ${b.pending_review_count?'<span class="tag tag-review">待复核 '+b.pending_review_count+'</span>':''}
+      </th></tr></thead>
+      <tbody><tr><td>
+      <table>
+        <tr><th>坝段</th><th>指标</th><th>读数/控制值</th><th>状态</th><th>外部编号</th><th>报告时间</th></tr>
+        ${b.readings.map(x=>`<tr>
+          <td>${esc(x.dam_section)}</td>
+          <td>${METRICS[x.metric]||x.metric}</td>
+          <td>${x.value} / ${x.control_value}
+            ${x.breach?'<span class="tag tag-breach">超限</span>':''}</td>
+          <td>${x.state==='pending_review'
+              ?'<span class="tag tag-review">待复核</span>'
+              :'<span class="tag tag-ok">已确认</span>'}</td>
+          <td>${esc(x.external_ref||'-')}</td>
+          <td class="muted">${fmt(x.reported_at)}</td>
+        </tr>`).join('')}
+      </table></td></tr></tbody>
+    </table>`).join('') || '<p class="muted">没有符合筛选条件的批次。</p>';
+}
+async function loadTasks(){
+  const r=await fetch('/api/tasks',{headers:HDR});
+  const data=await r.json();
+  const tasks=data.tasks||[];
+  document.getElementById('tasks').innerHTML=`
+    <table><thead><tr><th colspan="7">处置任务（${tasks.length}）</th></tr>
+      <tr><th>#</th><th>缺陷</th><th>责任人</th><th>到场时限</th><th>状态</th><th>接手人</th><th>说明</th></tr></thead>
+      <tbody>${tasks.map(t=>`<tr>
+        <td>${t.id}</td><td>#${t.item_id}</td><td>${esc(t.assignee)}</td>
+        <td>${fmt(t.due_at)}</td>
+        <td><span class="tag tag-${t.status}">${t.status}</span></td>
+        <td>${esc(t.accepted_by||'-')}</td><td class="muted">${esc(t.detail)}</td>
+      </tr>`).join('')}</tbody></table>`;
+}
+loadBatches('priority');loadTasks();
+</script>
+</body>
+</html>

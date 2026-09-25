@@ -65,6 +65,51 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_ref TEXT,
+                    inspector TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_batches_ref
+                    ON batches(batch_ref) WHERE batch_ref IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+                    item_id INTEGER REFERENCES items(id) ON DELETE SET NULL,
+                    dam_section TEXT NOT NULL,
+                    metric TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    control_value REAL NOT NULL,
+                    breach INTEGER NOT NULL DEFAULT 0,
+                    external_ref TEXT,
+                    reported_at TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'confirmed'
+                        CHECK(state IN ('pending_review','confirmed')),
+                    note TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_readings_batch ON readings(batch_id);
+                CREATE INDEX IF NOT EXISTS ix_readings_state ON readings(state);
+                CREATE INDEX IF NOT EXISTS ix_readings_ref ON readings(external_ref);
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    reading_id INTEGER REFERENCES readings(id) ON DELETE SET NULL,
+                    assignee TEXT NOT NULL,
+                    due_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','accepted','done')),
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    accepted_by TEXT,
+                    accepted_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks(status);
             """)
 
     @staticmethod
@@ -213,3 +258,189 @@ class Repository:
     def close(self) -> None:
         with self._lock:
             self.conn.close()
+
+    # ---- 巡检批次 / 读数 / 处置任务 ----
+    def create_batch(self, batch_ref: Optional[str], inspector: str, note: str,
+                     actor: str, created_at: str) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO batches(batch_ref, inspector, note, created_by, created_at)
+                   VALUES(?,?,?,?,?)""",
+                (batch_ref, inspector, note, actor, created_at),
+            )
+            batch_id = int(cur.lastrowid)
+        return self.get_batch(batch_id)
+
+    def get_batch(self, batch_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("批次不存在")
+        return dict(row)
+
+    def find_batch_by_ref(self, batch_ref: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM batches WHERE batch_ref=?", (batch_ref,)).fetchone()
+        return dict(row) if row else None
+
+    def list_batches(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM batches ORDER BY id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def create_reading(self, batch_id: int, item_id: Optional[int], dam_section: str,
+                       metric: str, value: float, control_value: float, breach: bool,
+                       external_ref: Optional[str], reported_at: str, state: str,
+                       note: str, actor: str, created_at: str) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO readings(batch_id, item_id, dam_section, metric, value,
+                   control_value, breach, external_ref, reported_at, state, note,
+                   created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (batch_id, item_id, dam_section, metric, value, control_value,
+                 1 if breach else 0, external_ref, reported_at, state, note,
+                 actor, created_at),
+            )
+            reading_id = int(cur.lastrowid)
+        return self.get_reading(reading_id)
+
+    def get_reading(self, reading_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM readings WHERE id=?", (reading_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("读数不存在")
+        reading = dict(row)
+        reading["breach"] = bool(reading["breach"])
+        return reading
+
+    def list_readings(self, batch_id: Optional[int] = None,
+                      state: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM readings"
+        clauses, params = [], []
+        if batch_id is not None:
+            clauses.append("batch_id=?"); params.append(batch_id)
+        if state:
+            clauses.append("state=?"); params.append(state)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+        result = []
+        for row in rows:
+            reading = dict(row)
+            reading["breach"] = bool(reading["breach"])
+            result.append(reading)
+        return result
+
+    def find_reading_by_ref(self, external_ref: str) -> Optional[Dict[str, Any]]:
+        """按外部编号找历史读数，用于重复编号合并与矛盾判定"""
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT * FROM readings WHERE external_ref=?
+                   ORDER BY reported_at ASC, id ASC""",
+                (external_ref,)).fetchall()
+        if not rows:
+            return None
+        reading = dict(rows[0])
+        reading["breach"] = bool(reading["breach"])
+        return reading
+
+    def update_reading(self, reading_id: int, **fields) -> Dict[str, Any]:
+        if not fields:
+            return self.get_reading(reading_id)
+        columns = ", ".join(f"{key}=?" for key in fields)
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                f"UPDATE readings SET {columns} WHERE id=?",
+                (*fields.values(), reading_id))
+            if cur.rowcount == 0:
+                raise NotFoundError("读数不存在")
+        return self.get_reading(reading_id)
+
+    def create_task(self, item_id: int, reading_id: Optional[int], assignee: str,
+                    due_at: str, detail: str, actor: str,
+                    created_at: str) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO tasks(item_id, reading_id, assignee, due_at, status,
+                   detail, created_by, created_at) VALUES(?,?,?,?,'open',?,?,?)""",
+                (item_id, reading_id, assignee, due_at, detail, actor, created_at),
+            )
+            task_id = int(cur.lastrowid)
+        return self.get_task(task_id)
+
+    def get_task(self, task_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("处置任务不存在")
+        return dict(row)
+
+    def list_tasks(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM tasks"
+        params: tuple = ()
+        if status:
+            sql += " WHERE status=?"
+            params = (status,)
+        sql += " ORDER BY due_at ASC, id ASC"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def open_task_exists(self, item_id: int) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE item_id=? AND status!='done'",
+                (item_id,)).fetchone()
+        return int(row["n"]) > 0
+
+    def accept_task(self, task_id: int, actor: str, accepted_at: str) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE tasks SET status='accepted', accepted_by=?, accepted_at=?
+                   WHERE id=? AND status='open'""",
+                (actor, accepted_at, task_id))
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("处置任务不存在")
+                raise ConflictError("该任务已被接手")
+        return self.get_task(task_id)
+
+    def has_closed_reinspection(self, item_id: int) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COUNT(*) AS n FROM records
+                   WHERE item_id=? AND kind=? AND status='closed'""",
+                (item_id, "reinspection")).fetchone()
+        return int(row["n"]) > 0
+
+    def priority_item_ids(self) -> List[int]:
+        """优先队列：存在超控制值读数的缺陷ID"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT item_id FROM readings WHERE breach=1 AND item_id IS NOT NULL"
+            ).fetchall()
+        return [int(row["item_id"]) for row in rows]
+
+    def review_batch_ids(self) -> List[int]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT batch_id FROM readings WHERE state='pending_review'"
+            ).fetchall()
+        return [int(row["batch_id"]) for row in rows]
+
+    def batch_item_ids(self, batch_id: int) -> List[int]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT item_id FROM readings WHERE batch_id=? AND item_id IS NOT NULL",
+                (batch_id,)).fetchall()
+        return [int(row["item_id"]) for row in rows]

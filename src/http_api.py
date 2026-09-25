@@ -75,7 +75,9 @@ def make_handler(service: Service, static_dir: str):
 
         def do_GET(self) -> None:
             try:
-                path = urlparse(self.path).path
+                parsed = urlparse(self.path)
+                path = parsed.path
+                query = parse_qs(parsed.query)
                 if path == "/health":
                     self._json(200, {"status": "ok"})
                 elif path == "/":
@@ -83,7 +85,29 @@ def make_handler(service: Service, static_dir: str):
                 elif path == "/api/items":
                     actor, role = self._identity()
                     del actor
-                    self._json(200, {"items": service.list_items(role)})
+                    status = query.get("status", [None])[0]
+                    queue = query.get("queue", [None])[0]
+                    self._json(200, {"items": service.list_items(role, status, queue)})
+                elif path == "/api/batches":
+                    actor, role = self._identity()
+                    del actor
+                    queue = query.get("queue", [None])[0]
+                    self._json(200, {"batches": service.list_batches(role, queue)})
+                elif path.startswith("/api/batches/"):
+                    batch_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_batch(batch_id, role))
+                elif path == "/api/tasks":
+                    actor, role = self._identity()
+                    del actor
+                    status = query.get("status", [None])[0]
+                    self._json(200, {"tasks": service.list_tasks(role, status)})
+                elif path.startswith("/api/tasks/"):
+                    task_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_task(task_id, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     actor, role = self._identity()
@@ -100,6 +124,8 @@ def make_handler(service: Service, static_dir: str):
                     self._json(200, {"events": service.audit(role)})
                 else:
                     self._json(404, {"error": "not_found"})
+            except (TypeError, ValueError):
+                self._json(404, {"error": "not_found"})
             except Exception as exc:
                 self._send_error(exc)
 
@@ -110,6 +136,15 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/batches":
+                    self._json(201, service.create_batch(body, actor, role))
+                elif path.startswith("/api/readings/") and path.endswith("/review"):
+                    reading_id = int(path.split("/")[3])
+                    self._json(200, service.review_reading(
+                        reading_id, body, actor, role))
+                elif path.startswith("/api/tasks/") and path.endswith("/accept"):
+                    task_id = int(path.split("/")[3])
+                    self._json(200, service.accept_task(task_id, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
@@ -121,6 +156,8 @@ def make_handler(service: Service, static_dir: str):
                         item_id, target, expected, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
+            except (TypeError, ValueError):
+                self._json(404, {"error": "not_found"})
             except Exception as exc:
                 self._send_error(exc)
 
