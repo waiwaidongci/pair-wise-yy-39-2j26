@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, READING_STATES, STATES
 
 
 class Repository:
@@ -24,6 +24,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        reading_states = ",".join("'" + s + "'" for s in READING_STATES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -38,10 +39,60 @@ class Repository:
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    source_batch_id INTEGER,
+                    metric TEXT,
+                    section TEXT,
+                    requires_reinspection INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_items_external_ref
                     ON items(external_ref) WHERE external_ref IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS inspection_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    external_ref TEXT NOT NULL UNIQUE,
+                    note TEXT,
+                    reported_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES inspection_batches(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    external_ref TEXT,
+                    section TEXT NOT NULL,
+                    metric TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    control_value REAL NOT NULL,
+                    reported_at TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ({reading_states})),
+                    severity TEXT,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    item_id INTEGER REFERENCES items(id) ON DELETE SET NULL,
+                    canonical_id INTEGER REFERENCES readings(id) ON DELETE SET NULL,
+                    repeat_count INTEGER NOT NULL DEFAULT 0,
+                    conflict_note TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(batch_id, external_ref)
+                );
+                CREATE INDEX IF NOT EXISTS ix_readings_external_ref ON readings(external_ref);
+                CREATE INDEX IF NOT EXISTS ix_readings_batch ON readings(batch_id);
+                CREATE TABLE IF NOT EXISTS disposal_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    reading_id INTEGER REFERENCES readings(id) ON DELETE SET NULL,
+                    title TEXT NOT NULL,
+                    assignee TEXT NOT NULL,
+                    assignee_role TEXT NOT NULL,
+                    deadline TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','claimed')),
+                    claimed_by TEXT,
+                    claimed_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_tasks_item ON disposal_tasks(item_id);
                 CREATE TABLE IF NOT EXISTS records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
@@ -66,6 +117,20 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+            self._migrate_columns("items", {
+                "source_batch_id": "INTEGER",
+                "metric": "TEXT",
+                "section": "TEXT",
+                "requires_reinspection": "INTEGER NOT NULL DEFAULT 0",
+            })
+
+    def _migrate_columns(self, table: str, columns: Dict[str, str]) -> None:
+        existing = {row["name"] for row in self.conn.execute(
+            f"PRAGMA table_info({table})").fetchall()}
+        for name, decl in columns.items():
+            if name not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -73,16 +138,22 @@ class Repository:
 
     def create_item(self, title: str, description: str, severity: str,
                     quantity: float, threshold: float, external_ref: Optional[str],
-                    actor: str) -> Dict[str, Any]:
+                    actor: str, initial_status: Optional[str] = None,
+                    source_batch_id: Optional[int] = None,
+                    metric: Optional[str] = None, section: Optional[str] = None,
+                    requires_reinspection: bool = False) -> Dict[str, Any]:
         now = utc_now()
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO items(title, description, severity, quantity, threshold,
-                       status, version, external_ref, created_by, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (title, description, severity, quantity, threshold, STATES[0], 1,
-                     external_ref, actor, now, now),
+                       status, version, external_ref, created_by, created_at, updated_at,
+                       source_batch_id, metric, section, requires_reinspection)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (title, description, severity, quantity, threshold,
+                     initial_status or STATES[0], 1,
+                     external_ref, actor, now, now,
+                     source_batch_id, metric, section, 1 if requires_reinspection else 0),
                 )
                 item_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -156,6 +227,164 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def closed_reinspection_count(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM records WHERE item_id=? "
+                "AND status='closed' AND kind='reinspection'",
+                (item_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    # ---- 巡检批次 -------------------------------------------------------
+    def create_batch(self, external_ref: str, note: Optional[str], reported_at: str,
+                     actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO inspection_batches(external_ref, note, reported_at,
+                       created_by, created_at) VALUES(?,?,?,?,?)""",
+                    (external_ref, note, reported_at, actor, now),
+                )
+                batch_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("批次外部编号已存在") from exc
+        return self.get_batch(batch_id)
+
+    def get_batch(self, batch_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM inspection_batches WHERE id=?", (batch_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("巡检批次不存在")
+        return dict(row)
+
+    def list_batches(self, queue: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT DISTINCT b.* FROM inspection_batches b"
+        params: tuple = ()
+        if queue == "priority":
+            sql += " JOIN readings r ON r.batch_id=b.id WHERE r.state='priority'"
+        elif queue == "review":
+            sql += " JOIN readings r ON r.batch_id=b.id WHERE r.state='review'"
+        sql += " ORDER BY b.id DESC"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_reading(self, batch_id: int, seq: int, external_ref: Optional[str],
+                       section: str, metric: str, value: float, control_value: float,
+                       reported_at: str, state: str, severity: Optional[str],
+                       priority: int, item_id: Optional[int], canonical_id: Optional[int],
+                       repeat_count: int, conflict_note: Optional[str],
+                       actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO readings(batch_id, seq, external_ref, section, metric, value,
+                   control_value, reported_at, state, severity, priority, item_id,
+                   canonical_id, repeat_count, conflict_note, created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (batch_id, seq, external_ref, section, metric, value, control_value,
+                 reported_at, state, severity, priority, item_id, canonical_id,
+                 repeat_count, conflict_note, actor, now),
+            )
+            reading_id = int(cur.lastrowid)
+        return self.get_reading(reading_id)
+
+    def get_reading(self, reading_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM readings WHERE id=?", (reading_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("读数不存在")
+        return dict(row)
+
+    def list_readings(self, batch_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM readings"
+        params: tuple = ()
+        if batch_id is not None:
+            sql += " WHERE batch_id=?"
+            params = (batch_id,)
+        sql += " ORDER BY batch_id, seq"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_canonical_reading(self, external_ref: str) -> Optional[Dict[str, Any]]:
+        """同一外部编号按最早报告时间取基准读数。"""
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM readings WHERE external_ref=? AND canonical_id IS NULL
+                   ORDER BY reported_at ASC, id ASC LIMIT 1""",
+                (external_ref,)).fetchone()
+        return dict(row) if row else None
+
+    def mark_reading(self, reading_id: int, state: str, item_id: Optional[int] = None,
+                     canonical_id: Optional[int] = None, repeat_count: Optional[int] = None,
+                     conflict_note: Optional[str] = None) -> None:
+        fields = ["state=?"]
+        params: list = [state]
+        if item_id is not None:
+            fields.append("item_id=?"); params.append(item_id)
+        if canonical_id is not None:
+            fields.append("canonical_id=?"); params.append(canonical_id)
+        if repeat_count is not None:
+            fields.append("repeat_count=?"); params.append(repeat_count)
+        if conflict_note is not None:
+            fields.append("conflict_note=?"); params.append(conflict_note)
+        params.append(reading_id)
+        with self._lock, self.conn:
+            self.conn.execute(
+                f"UPDATE readings SET {', '.join(fields)} WHERE id=?", params)
+
+    # ---- 处置任务 -------------------------------------------------------
+    def create_task(self, item_id: int, reading_id: Optional[int], title: str,
+                    assignee: str, assignee_role: str, deadline: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO disposal_tasks(item_id, reading_id, title, assignee,
+                   assignee_role, deadline, status, created_at)
+                   VALUES(?,?,?,?,?,?, 'open', ?)""",
+                (item_id, reading_id, title, assignee, assignee_role, deadline, now),
+            )
+            task_id = int(cur.lastrowid)
+        return self.get_task(task_id)
+
+    def get_task(self, task_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM disposal_tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("处置任务不存在")
+        return dict(row)
+
+    def claim_task(self, task_id: int, actor: str, claimed_at: str) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE disposal_tasks SET status='claimed', claimed_by=?, claimed_at=?
+                   WHERE id=? AND status='open'""",
+                (actor, claimed_at, task_id))
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM disposal_tasks WHERE id=?", (task_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("处置任务不存在")
+                raise ConflictError("任务已被接手")
+        return self.get_task(task_id)
+
+    def list_tasks(self, item_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM disposal_tasks"
+        params: tuple = ()
+        if item_id is not None:
+            sql += " WHERE item_id=?"
+            params = (item_id,)
+        sql += " ORDER BY deadline ASC, id ASC"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

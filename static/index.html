@@ -1,1 +1,41 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大坝巡检、缺陷与应急管理</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>大坝巡检、缺陷与应急管理</h1><p>安排巡检，记录渗流、位移、裂缝等缺陷并跟踪修复、复检和应急预案</p><p>异常值比控制阈值越高，缺陷优先级越高；应急处置缺陷必须完成复检并记录证据后才能关闭。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大坝巡检、缺陷与应急管理</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:980px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.45rem .9rem;margin-right:.4rem}table{border-collapse:collapse;width:100%;font-size:.9rem}td,th{border:1px solid #d8dee4;padding:.35rem .5rem;text-align:left}.prio{color:#b00}.review{color:#9a6700}</style></head>
+<body>
+<h1>大坝巡检、缺陷与应急管理</h1>
+<p>一批可带多个坝段读数；渗流、位移、裂缝超过控制值进入优先队列并生成带责任人和到场时限的处置任务；重复外部编号按最早报告时间合并，矛盾读数进待复核；复检记录缺失不能关闭。</p>
+<p>
+<button onclick="loadBatches('')">全部批次</button>
+<button onclick="loadBatches('priority')">优先队列</button>
+<button onclick="loadBatches('review')">待复核</button>
+<button onclick="loadTasks()">处置任务</button>
+</p>
+<pre id="out">使用X-Actor和X-Role请求头调用接口。</pre>
+<h2>登记巡检批次（inspector）</h2>
+<pre id="sample">{
+  "external_ref": "BATCH-20260925-01",
+  "readings": [
+    {"section": "13#坝段", "metric": "seepage", "value": 16, "control_value": 10, "external_ref": "R-13-S"},
+    {"section": "14#坝段", "metric": "crack", "value": 4, "control_value": 10, "external_ref": "R-14-C"}
+  ]
+}</pre>
+<button onclick="submitBatch()">提交批次</button>
+<script>
+function H(role,actor){return {'Content-Type':'application/json','X-Actor':actor||'demo','X-Role':role||'viewer'}}
+async function loadBatches(queue){
+  const qs=queue?('?queue='+queue):'';
+  const r=await fetch('/api/batches'+qs,{headers:H('viewer')});
+  const data=await r.json();
+  document.getElementById('out').textContent=JSON.stringify(data,null,2);
+}
+async function loadTasks(){
+  const r=await fetch('/api/tasks',{headers:H('viewer')});
+  document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2);
+}
+async function submitBatch(){
+  try{
+    const body=JSON.parse(document.getElementById('sample').textContent);
+    const r=await fetch('/api/batches',{method:'POST',headers:H('inspector','patrol'),body:JSON.stringify(body)});
+    document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2);
+  }catch(e){document.getElementById('out').textContent='JSON无效：'+e.message}
+}
+</script>
+</body></html>

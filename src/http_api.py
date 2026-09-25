@@ -84,11 +84,30 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
+                elif path == "/api/batches":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query).get("queue", [None])[0]
+                    self._json(200, {"batches": service.list_batches(role, query)})
+                elif path.startswith("/api/batches/"):
+                    batch_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_batch(batch_id, role))
+                elif path == "/api/tasks":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"tasks": service.list_tasks(role)})
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/tasks"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"tasks": service.list_tasks(role, item_id)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -110,6 +129,11 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/batches":
+                    self._json(201, service.submit_batch(body, actor, role))
+                elif path.startswith("/api/tasks/") and path.endswith("/claim"):
+                    task_id = int(path.split("/")[3])
+                    self._json(200, service.claim_task(task_id, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
