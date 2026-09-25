@@ -1,0 +1,1 @@
+"""Modular project package."""
